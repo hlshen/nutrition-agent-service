@@ -22,6 +22,8 @@ from google.adk.agents import Agent
 from google.adk.apps import App
 from google.adk.models import Gemini
 from google.genai import types
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -338,6 +340,14 @@ meal_planner_agent = Agent(
 # 3. ROOT COORDINATOR (GRAPH ENTRY POINT & ROUTING)
 # =====================================================================
 
+async def generate_memories_callback(callback_context: CallbackContext) -> None:
+    """Sends the session's events to Memory Bank for memory generation."""
+    logger.info("Triggering cross-session memory generation.")
+    try:
+        await callback_context.add_session_to_memory()
+    except Exception as e:
+        logger.error(f"Failed to generate memories: {e}")
+
 root_agent = Agent(
     name="nutrition_orchestrator",
     model=Gemini(
@@ -353,7 +363,9 @@ root_agent = Agent(
         "4. Output a highly organized, beautifully formatted Weekly Meal Plan and organized Grocery List.\n"
         "Never perform tasks yourself that should be handled by a specialized subagent."
     ),
-    sub_agents=[diet_preferences_agent, pantry_supply_agent, meal_planner_agent]
+    sub_agents=[diet_preferences_agent, pantry_supply_agent, meal_planner_agent],
+    tools=[PreloadMemoryTool()],
+    after_agent_callback=generate_memories_callback
 )
 
 # Packaging the agent execution graph into a deployable App instance
