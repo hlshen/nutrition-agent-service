@@ -132,17 +132,75 @@ class MealPlannerOutput(BaseModel):
     weekly_meal_plan: str = Field(description="A beautifully formatted markdown meal plan and grocery list.")
 
 # Setup PII Scrubbing and Structured Logging
+from google.cloud import dlp_v2
+
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 PHONE_REGEX = re.compile(r"\b(?:\+?(\d{1,3}))?[-. (]*(\d{3})[-. )]*(\d{3})[-. ]*(\d{4})\b")
+
+_dlp_client: dlp_v2.DlpServiceClient | None = None
+
+def _get_dlp_client() -> dlp_v2.DlpServiceClient | None:
+    global _dlp_client
+    if _dlp_client is None:
+        try:
+            _dlp_client = dlp_v2.DlpServiceClient()
+        except Exception:
+            pass
+    return _dlp_client
 
 def scrub_pii(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
-    # Scrub email addresses
+    
+    # Local Regex Redaction (First line of defense / offline fallback)
     text = EMAIL_REGEX.sub("[REDACTED_EMAIL]", text)
-    # Scrub telephone numbers
     text = PHONE_REGEX.sub("[REDACTED_PHONE]", text)
-    return text
+    
+    # Enhanced Cloud DLP Redaction
+    client = _get_dlp_client()
+    if client is None:
+        return text
+        
+    try:
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "ai5days-503118")
+        parent = f"projects/{project_id}"
+        
+        info_types = [
+            {"name": "EMAIL_ADDRESS"},
+            {"name": "PHONE_NUMBER"},
+            {"name": "PERSON_NAME"},
+            {"name": "US_SOCIAL_SECURITY_NUMBER"},
+            {"name": "IP_ADDRESS"},
+        ]
+        
+        inspect_config = {
+            "info_types": info_types,
+            "min_likelihood": dlp_v2.Likelihood.LIKELIHOOD_UNSPECIFIED,
+        }
+        
+        deidentify_config = {
+            "info_type_transformations": {
+                "transformations": [
+                    {
+                        "primitive_transformation": {
+                            "replace_with_info_type_config": {}
+                        }
+                    }
+                ]
+            }
+        }
+        
+        response = client.deidentify_content(
+            request={
+                "parent": parent,
+                "deidentify_config": deidentify_config,
+                "inspect_config": inspect_config,
+                "item": {"value": text},
+            }
+        )
+        return response.item.value
+    except Exception:
+        return text
 
 class StructuredJSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
