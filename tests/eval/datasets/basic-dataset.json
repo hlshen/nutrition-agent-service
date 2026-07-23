@@ -1,0 +1,37 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "scenario_1_diet_preferences_setup",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "I want to start a Keto diet limiting myself to 2,000 calories with a 70% Fat, 25% Protein, and 5% Carb split, and I hate mushrooms."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "scenario_2_pantry_supplies_update",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "I just bought 500g of chicken breast, 1 bag of fresh spinach, and used up all my rice."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "scenario_3_meal_plan_generation",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Help me prepare my meal plan and grocery list for the next 3 days."
+          }
+        ]
+      }
+    }
+  ]
+}
