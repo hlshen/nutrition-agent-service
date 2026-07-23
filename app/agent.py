@@ -795,7 +795,7 @@ async def root_after_agent_callback(callback_context: CallbackContext) -> None:
 root_agent = Agent(
     name="nutrition_orchestrator",
     model=Gemini(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-pro",
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
