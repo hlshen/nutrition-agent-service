@@ -16,6 +16,9 @@
 from __future__ import annotations
 import os
 import logging
+import json
+import re
+import datetime
 from typing import List, Dict, Any
 
 from google.adk.agents import Agent
@@ -24,24 +27,52 @@ from google.adk.models import Gemini
 from google.genai import types
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
+from google.adk.tools import ToolContext
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup PII Scrubbing and Structured Logging
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+PHONE_REGEX = re.compile(r"\b(?:\+?(\d{1,3}))?[-. (]*(\d{3})[-. )]*(\d{3})[-. ]*(\d{4})\b")
+
+def scrub_pii(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    # Scrub email addresses
+    text = EMAIL_REGEX.sub("[REDACTED_EMAIL]", text)
+    # Scrub telephone numbers
+    text = PHONE_REGEX.sub("[REDACTED_PHONE]", text)
+    return text
+
+class StructuredJSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_data = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": scrub_pii(record.getMessage()),
+        }
+        # Safely extract extra fields if present
+        for field in ("user_id", "trace_id", "session_id", "agent_name", "event"):
+            if hasattr(record, field):
+                val = getattr(record, field)
+                if val is not None:
+                    log_data[field] = scrub_pii(str(val)) if field == "user_id" else val
+        
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_data)
+
 logger = logging.getLogger("nutrition_agent")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+
+handler = logging.StreamHandler()
+handler.setFormatter(StructuredJSONFormatter())
+logger.addHandler(handler)
 
 # Initialize Firestore Client
-try:
-    from google.cloud import firestore
-    # Let Firestore use the environment-configured project or default
-    db = firestore.Client()
-    logger.info("Firestore client initialized successfully.")
-except Exception as e:
-    logger.warning(f"Failed to initialize Firestore client: {e}. Falling back to in-memory store.")
-    db = None
-
-# In-memory fallbacks for robust operation (e.g. locally or without credentials)
-_mock_profiles: Dict[str, Dict[str, Any]] = {}
-_mock_pantry: Dict[str, List[Dict[str, Any]]] = {}
+from google.cloud import firestore
+db = firestore.Client()
+logger.info("Firestore client initialized successfully.")
 
 # =====================================================================
 # 1. TOOL IMPLEMENTATIONS
@@ -57,30 +88,13 @@ def get_user_profile(user_id: str) -> Dict[str, Any]:
         A dictionary containing calorie goals, gram target splits, and dietary restrictions.
     """
     logger.info(f"Retrieving user profile for user: {user_id}")
-    if db is not None:
-        try:
-            doc_ref = db.collection("user_profiles").document(user_id)
-            doc = doc_ref.get()
-            if doc.exists:
-                return doc.to_dict()
-        except Exception as e:
-            logger.error(f"Error reading from Firestore: {e}")
-            
-    # Fallback to mock in-memory
-    if user_id in _mock_profiles:
-        return _mock_profiles[user_id]
-        
-    # Default starter profile (or scenario-ready default)
-    return {
-        "user_id": user_id,
-        "calories": 2000,
-        "macros": {"protein_g": 125.0, "carbs_g": 25.0, "fat_g": 155.5},
-        "allergies": [],
-        "dislikes": ["mushrooms"],
-        "diet_tag": "Keto"
-    }
+    doc_ref = db.collection("user_profiles").document(user_id)
+    doc = doc_ref.get()
+    if doc.exists:
+        return doc.to_dict()
+    return {}
 
-def update_user_profile(user_id: str, profile_data: Dict[str, Any]) -> bool:
+def update_user_profile(user_id: str, profile_data: Dict[str, Any], tool_context: ToolContext = None) -> bool:
     """Updates the user's dietary preferences and target metrics in Firestore.
     
     If calorie and macro percentage split targets are provided, the corresponding
@@ -92,10 +106,18 @@ def update_user_profile(user_id: str, profile_data: Dict[str, Any]) -> bool:
     Args:
         user_id: The unique system identifier for the customer.
         profile_data: Key-value updates (e.g., target calories, new disliked foods, macro split percentages).
+        tool_context: Optional context for human-in-the-loop validation and approvals.
         
     Returns:
         True if the write transaction completed successfully, False otherwise.
     """
+    if tool_context is not None:
+        if not tool_context.tool_confirmation or not tool_context.tool_confirmation.confirmed:
+            tool_context.request_confirmation(
+                hint=f"Please confirm updating your dietary profile guidelines with: {profile_data}"
+            )
+            return False
+
     logger.info(f"Updating user profile for user: {user_id} with data: {profile_data}")
     
     # Calculate grams if percent splits and calories are specified
@@ -127,16 +149,8 @@ def update_user_profile(user_id: str, profile_data: Dict[str, Any]) -> bool:
     current = get_user_profile(user_id)
     current.update(profile_data)
     
-    # Store
-    if db is not None:
-        try:
-            db.collection("user_profiles").document(user_id).set(current)
-            return True
-        except Exception as e:
-            logger.error(f"Error writing to Firestore: {e}")
-            
-    # Mock fallback
-    _mock_profiles[user_id] = current
+    # Store strictly to Firestore
+    db.collection("user_profiles").document(user_id).set(current)
     return True
 
 def query_pantry_supplies(user_id: str) -> List[Dict[str, Any]]:
@@ -149,36 +163,32 @@ def query_pantry_supplies(user_id: str) -> List[Dict[str, Any]]:
         A list of active food items, each showing quantity (grams/units) and estimated expiration timeline.
     """
     logger.info(f"Retrieving pantry supplies for user: {user_id}")
-    if db is not None:
-        try:
-            doc_ref = db.collection("pantry_supplies").document(user_id)
-            doc = doc_ref.get()
-            if doc.exists:
-                data = doc.to_dict()
-                return data.get("items", [])
-        except Exception as e:
-            logger.error(f"Error reading pantry supplies from Firestore: {e}")
-            
-    # Fallback to mock in-memory
-    if user_id in _mock_pantry:
-        return _mock_pantry[user_id]
-        
-    # Default pantry stock as defined in Scenario 2 "Given" state: 300g of chicken breast
-    return [
-        {"item": "chicken breast", "quantity_g": 300, "expiry_days": 3}
-    ]
+    doc_ref = db.collection("pantry_supplies").document(user_id)
+    doc = doc_ref.get()
+    if doc.exists:
+        data = doc.to_dict()
+        return data.get("items", [])
+    return []
 
-def update_pantry_supplies(user_id: str, items: List[Dict[str, Any]], operation: str = "upsert") -> bool:
+def update_pantry_supplies(user_id: str, items: List[Dict[str, Any]], operation: str = "upsert", tool_context: ToolContext = None) -> bool:
     """Updates pantry inventory by adding purchased items or subtracting consumed items.
     
     Args:
         user_id: The unique system identifier for the customer.
         items: List of dictionary records containing "item" and "quantity_g".
         operation: 'upsert' to add/increment stock, 'consume' or 'delete' to subtract or remove.
+        tool_context: Optional context for human-in-the-loop validation and approvals.
         
     Returns:
         True if the database transaction completed successfully, False otherwise.
     """
+    if tool_context is not None:
+        if not tool_context.tool_confirmation or not tool_context.tool_confirmation.confirmed:
+            tool_context.request_confirmation(
+                hint=f"Please confirm updating your pantry supplies: {operation}ing items: {items}"
+            )
+            return False
+
     logger.info(f"Updating pantry supplies for user: {user_id} with items: {items}, operation: {operation}")
     
     current_items = query_pantry_supplies(user_id)
@@ -207,14 +217,8 @@ def update_pantry_supplies(user_id: str, items: List[Dict[str, Any]], operation:
                     
     updated_list = list(pantry_dict.values())
     
-    if db is not None:
-        try:
-            db.collection("pantry_supplies").document(user_id).set({"items": updated_list})
-            return True
-        except Exception as e:
-            logger.error(f"Error writing pantry supplies to Firestore: {e}")
-            
-    _mock_pantry[user_id] = updated_list
+    # Store strictly to Firestore
+    db.collection("pantry_supplies").document(user_id).set({"items": updated_list})
     return True
 
 def fetch_recipes(target_calories: int, exclusions: List[str], focus_ingredients: List[str]) -> List[Dict[str, Any]]:
@@ -296,10 +300,36 @@ def fetch_recipes(target_calories: int, exclusions: List[str], focus_ingredients
 # 2. COLLABORATIVE SUBAGENTS (ADK 2.0 DECLARATIVE MODEL)
 # =====================================================================
 
+async def log_before_agent(callback_context: CallbackContext) -> None:
+    """Logs the entry state of an agent with standard trace contexts."""
+    logger.info(
+        f"Entering Agent: {callback_context.agent_name}",
+        extra={
+            "user_id": callback_context.user_id,
+            "trace_id": callback_context.run_id,
+            "session_id": callback_context.session.id if callback_context.session else None,
+            "agent_name": callback_context.agent_name,
+            "event": "agent_enter"
+        }
+    )
+
+async def log_after_agent(callback_context: CallbackContext) -> None:
+    """Logs the exit state of an agent with standard trace contexts."""
+    logger.info(
+        f"Exiting Agent: {callback_context.agent_name}",
+        extra={
+            "user_id": callback_context.user_id,
+            "trace_id": callback_context.run_id,
+            "session_id": callback_context.session.id if callback_context.session else None,
+            "agent_name": callback_context.agent_name,
+            "event": "agent_exit"
+        }
+    )
+
 diet_preferences_agent = Agent(
     name="diet_preferences_agent",
     model=Gemini(
-        model="gemini-3.5-flash",
+        model="gemini-2.5-flash",
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
@@ -307,41 +337,48 @@ diet_preferences_agent = Agent(
         "calculating healthy macronutrient allocations, and tracking active food likes, dislikes, and allergens. "
         "Use the provided tools to query or update profiles. Always perform any calorie-to-gram math accurately."
     ),
-    tools=[get_user_profile, update_user_profile]
+    tools=[get_user_profile, update_user_profile],
+    before_agent_callback=log_before_agent,
+    after_agent_callback=log_after_agent
 )
 
 pantry_supply_agent = Agent(
     name="pantry_supply_agent",
     model=Gemini(
-        model="gemini-3.5-flash",
+        model="gemini-2.5-flash",
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
         "You are an expert pantry supervisor. Your responsibility is to audit inventory levels, estimate ingredient "
         "volumes from natural descriptions, and note impending expiration dates. Use the pantry tools to read/write state."
     ),
-    tools=[query_pantry_supplies, update_pantry_supplies]
+    tools=[query_pantry_supplies, update_pantry_supplies],
+    before_agent_callback=log_before_agent,
+    after_agent_callback=log_after_agent
 )
 
 meal_planner_agent = Agent(
     name="meal_planner_agent",
     model=Gemini(
-        model="gemini-3.5-flash",
+        model="gemini-2.5-flash",
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
         "You are a master culinary planner. Analyze target caloric limits, ingredient dislikes, and available "
         "pantry items. Match them to high-quality recipes. Compute missing components to generate a logical shopping list."
     ),
-    tools=[fetch_recipes]
+    tools=[fetch_recipes],
+    before_agent_callback=log_before_agent,
+    after_agent_callback=log_after_agent
 )
 
 # =====================================================================
 # 3. ROOT COORDINATOR (GRAPH ENTRY POINT & ROUTING)
 # =====================================================================
 
-async def generate_memories_callback(callback_context: CallbackContext) -> None:
-    """Sends the session's events to Memory Bank for memory generation."""
+async def root_after_agent_callback(callback_context: CallbackContext) -> None:
+    """Combines transition exit tracing and cross-session memory generation."""
+    await log_after_agent(callback_context)
     logger.info("Triggering cross-session memory generation.")
     try:
         await callback_context.add_session_to_memory()
@@ -365,7 +402,8 @@ root_agent = Agent(
     ),
     sub_agents=[diet_preferences_agent, pantry_supply_agent, meal_planner_agent],
     tools=[PreloadMemoryTool()],
-    after_agent_callback=generate_memories_callback
+    before_agent_callback=log_before_agent,
+    after_agent_callback=root_after_agent_callback
 )
 
 # Packaging the agent execution graph into a deployable App instance
