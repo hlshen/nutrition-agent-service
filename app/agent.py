@@ -745,28 +745,82 @@ def guided_model_error_handler(context: Any, llm_request: Any, error: Exception)
 # =====================================================================
 
 async def log_before_agent(callback_context: CallbackContext) -> None:
-    """Logs the entry state of an agent with standard trace contexts."""
+    """Logs the entry state of an agent, capturing its input/intent."""
+    intent = callback_context.user_content or "No explicit user content provided."
     logger.info(
-        f"Entering Agent: {callback_context.agent_name}",
+        f"Entering Agent: {callback_context.agent_name} | Intended Goal: {intent}",
         extra={
             "user_id": callback_context.user_id,
             "trace_id": callback_context.run_id,
             "session_id": callback_context.session.id if callback_context.session else None,
             "agent_name": callback_context.agent_name,
-            "event": "agent_enter"
+            "event": "agent_enter",
+            "agent_intent": intent
         }
     )
 
 async def log_after_agent(callback_context: CallbackContext) -> None:
-    """Logs the exit state of an agent with standard trace contexts."""
+    """Logs the exit state of an agent, comparing intent with actual execution output."""
+    intent = str(callback_context.user_content or "").strip()
+    actual_output = str(callback_context.output or "").strip()
+    
+    # Simple semantic overlap check to evaluate if intent matches execution
+    intent_lower = intent.lower()
+    actual_lower = actual_output.lower()
+    
+    # Extract significant words from intent (excluding common query stop words)
+    words = [w for w in re.findall(r"\b\w{4,}\b", intent_lower) if w not in ("user", "agent", "please", "thanks", "query", "helper")]
+    
+    if words:
+        matching_words = [w for w in words if w in actual_lower]
+        intent_match = "YES" if len(matching_words) / len(words) >= 0.25 else "PARTIAL/NO"
+    else:
+        intent_match = "YES" if actual_output else "NO"
+        
     logger.info(
-        f"Exiting Agent: {callback_context.agent_name}",
+        f"Exiting Agent: {callback_context.agent_name} | Intent Match: {intent_match}\n"
+        f"  - Intent: {intent}\n"
+        f"  - Actual Output: {actual_output[:200]}...",
         extra={
             "user_id": callback_context.user_id,
             "trace_id": callback_context.run_id,
             "session_id": callback_context.session.id if callback_context.session else None,
             "agent_name": callback_context.agent_name,
-            "event": "agent_exit"
+            "event": "agent_exit",
+            "agent_intent": intent,
+            "actual_execution": actual_output,
+            "intent_match": intent_match
+        }
+    )
+
+async def log_before_tool(tool: Any, args: dict[str, Any], context: Any) -> None:
+    """Logs the before-tool callback, capturing the intent of the tool execution."""
+    tool_name = tool.name if hasattr(tool, "name") else str(tool)
+    logger.info(
+        f"Intended Tool Call: Calling '{tool_name}' with arguments: {args}",
+        extra={
+            "tool_name": tool_name,
+            "tool_args": args,
+            "event": "tool_call_start"
+        }
+    )
+
+async def log_after_tool(tool: Any, args: dict[str, Any], context: Any, output: dict) -> None:
+    """Logs the after-tool callback, evaluating execution correctness against intent."""
+    tool_name = tool.name if hasattr(tool, "name") else str(tool)
+    
+    # Check if the output signifies an error / mismatch with successful intent
+    has_error = "error" in output or output.get("status") == "error" or not output.get("success", True)
+    execution_success = "NO (Error encountered)" if has_error else "YES"
+    
+    logger.info(
+        f"Completed Tool Call: '{tool_name}' | Execution Success: {execution_success} | Output: {output}",
+        extra={
+            "tool_name": tool_name,
+            "tool_args": args,
+            "tool_output": output,
+            "execution_success": execution_success,
+            "event": "tool_call_end"
         }
     )
 
@@ -789,6 +843,8 @@ diet_preferences_agent = Agent(
     tools=[get_user_profile, update_user_profile],
     before_agent_callback=log_before_agent,
     after_agent_callback=log_after_agent,
+    before_tool_callback=log_before_tool,
+    after_tool_callback=log_after_tool,
     on_tool_error_callback=guided_tool_error_handler,
     on_model_error_callback=guided_model_error_handler
 )
@@ -811,6 +867,8 @@ pantry_supply_agent = Agent(
     tools=[query_pantry_supplies, update_pantry_supplies],
     before_agent_callback=log_before_agent,
     after_agent_callback=log_after_agent,
+    before_tool_callback=log_before_tool,
+    after_tool_callback=log_after_tool,
     on_tool_error_callback=guided_tool_error_handler,
     on_model_error_callback=guided_model_error_handler
 )
@@ -833,6 +891,8 @@ meal_planner_agent = Agent(
     tools=[fetch_recipes],
     before_agent_callback=log_before_agent,
     after_agent_callback=log_after_agent,
+    before_tool_callback=log_before_tool,
+    after_tool_callback=log_after_tool,
     on_tool_error_callback=guided_tool_error_handler,
     on_model_error_callback=guided_model_error_handler
 )
@@ -869,6 +929,8 @@ root_agent = Agent(
     tools=[PreloadMemoryTool()],
     before_agent_callback=log_before_agent,
     after_agent_callback=root_after_agent_callback,
+    before_tool_callback=log_before_tool,
+    after_tool_callback=log_after_tool,
     on_tool_error_callback=guided_tool_error_handler,
     on_model_error_callback=guided_model_error_handler
 )
